@@ -16,6 +16,10 @@ enum EngineTuning {
         "HV_WFI_SPIN": "0",    // microseconds an idle CPU watches for work before sleeping
         "HV_FLUSH": "2",       // disk flush: F_BARRIERFSYNC, ordered but without a full fsync
         "HV_STATS": "10",      // seconds between engine stats lines in the log; 0 = off
+        "MTL_DEBUG_LAYER": "0", // disable Metal validation layer aborts
+        "METAL_DEBUG_ERROR_MODE": "0", // ignore Metal validation errors instead of calling abort()
+        "MTL_ERROR_MODE": "0",
+        "METAL_DEVICE_WRAPPER_TYPE": "0",
     ]
 
     static func apply() {

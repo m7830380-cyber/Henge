@@ -228,6 +228,10 @@ static NSUInteger pixel_bytes(MTLPixelFormat f) {
     case MTLPixelFormatRG32Uint: case MTLPixelFormatRG32Sint: case MTLPixelFormatRG32Float: case MTLPixelFormatRGBA16Unorm: case MTLPixelFormatRGBA16Snorm:
     case MTLPixelFormatRGBA16Uint: case MTLPixelFormatRGBA16Sint: case MTLPixelFormatRGBA16Float: return 8;
     case MTLPixelFormatRGBA32Uint: case MTLPixelFormatRGBA32Sint: case MTLPixelFormatRGBA32Float: return 16;
+    case MTLPixelFormatDepth16Unorm: return 2;
+    case MTLPixelFormatDepth32Float: return 4;
+    case MTLPixelFormatStencil8: return 1;
+    case MTLPixelFormatDepth32Float_Stencil8: case MTLPixelFormatX32_Stencil8: return 8;
     default: return 0;
     }
 }
@@ -373,12 +377,96 @@ static MTLTextureSwizzleChannels safe_swizzle(const uint8_t *sw, const uint8_t *
     return MTLTextureSwizzleChannelsMake(sw[0], sw[1], sw[2], sw[3]);
 }
 
+static inline BOOL is_v2_tag(uint32_t tag) {
+    return (tag >= 0x30 && tag <= 0x3f);
+}
+
+/* Metal aborts on unsupported/invalid pixel formats in setPixelFormat: via MTLDebugValidateMTLPixelFormat.
+   macOS guests (especially 3D apps like Roblox Studio) request macOS-specific formats (Depth24_Stencil8,
+   BC1..BC7) or pass unaligned v2 structures that read as garbage. Remap or sanitize to valid iOS formats. */
+static MTLPixelFormat safe_pixel_format(MTLPixelFormat fmt) {
+    // 1. Remap macOS-only Depth24 / Stencil formats
+    if ((NSUInteger)fmt == 255 /* MTLPixelFormatDepth24Unorm_Stencil8 */) {
+        return MTLPixelFormatDepth32Float_Stencil8; // 260
+    }
+    if ((NSUInteger)fmt == 262 /* MTLPixelFormatX24_Stencil8 */) {
+        return MTLPixelFormatX32_Stencil8; // 261
+    }
+
+    // 2. Remap macOS-only BC (Block Compression) formats
+    switch ((NSUInteger)fmt) {
+    case 130: /* BC1_RGBA */
+    case 132: /* BC2_RGBA */
+    case 134: /* BC3_RGBA */
+    case 152: /* BC7_RGBAUnorm */
+        return MTLPixelFormatRGBA8Unorm;
+    case 131: /* BC1_RGBA_sRGB */
+    case 133: /* BC2_RGBA_sRGB */
+    case 135: /* BC3_RGBA_sRGB */
+    case 153: /* BC7_RGBAUnorm_sRGB */
+        return MTLPixelFormatRGBA8Unorm_sRGB;
+    case 140: /* BC4_RUnorm */
+        return MTLPixelFormatR8Unorm;
+    case 141: /* BC4_RSnorm */
+        return MTLPixelFormatR8Snorm;
+    case 142: /* BC5_RGUnorm */
+        return MTLPixelFormatRG8Unorm;
+    case 143: /* BC5_RGSnorm */
+        return MTLPixelFormatRG8Snorm;
+    case 150: /* BC6H_RGBFloat */
+    case 151: /* BC6H_RGBUfloat */
+        return MTLPixelFormatRGBA16Float;
+    default:
+        break;
+    }
+
+    // 3. Whitelist check for known valid iOS Metal pixel formats
+    switch (fmt) {
+    case MTLPixelFormatA8Unorm:
+    case MTLPixelFormatR8Unorm: case MTLPixelFormatR8Unorm_sRGB: case MTLPixelFormatR8Snorm:
+    case MTLPixelFormatR8Uint: case MTLPixelFormatR8Sint:
+    case MTLPixelFormatR16Unorm: case MTLPixelFormatR16Snorm: case MTLPixelFormatR16Uint:
+    case MTLPixelFormatR16Sint: case MTLPixelFormatR16Float:
+    case MTLPixelFormatRG8Unorm: case MTLPixelFormatRG8Unorm_sRGB: case MTLPixelFormatRG8Snorm:
+    case MTLPixelFormatRG8Uint: case MTLPixelFormatRG8Sint:
+    case MTLPixelFormatB5G6R5Unorm: case MTLPixelFormatA1BGR5Unorm: case MTLPixelFormatABGR4Unorm:
+    case MTLPixelFormatBGR5A1Unorm:
+    case MTLPixelFormatR32Uint: case MTLPixelFormatR32Sint: case MTLPixelFormatR32Float:
+    case MTLPixelFormatRG16Unorm: case MTLPixelFormatRG16Snorm: case MTLPixelFormatRG16Uint:
+    case MTLPixelFormatRG16Sint: case MTLPixelFormatRG16Float:
+    case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Unorm_sRGB: case MTLPixelFormatRGBA8Snorm:
+    case MTLPixelFormatRGBA8Uint: case MTLPixelFormatRGBA8Sint:
+    case MTLPixelFormatBGRA8Unorm: case MTLPixelFormatBGRA8Unorm_sRGB:
+    case MTLPixelFormatRGB10A2Unorm: case MTLPixelFormatRGB10A2Uint: case MTLPixelFormatRG11B10Float:
+    case MTLPixelFormatRGB9E5Float: case MTLPixelFormatBGR10A2Unorm:
+    case MTLPixelFormatRG32Uint: case MTLPixelFormatRG32Sint: case MTLPixelFormatRG32Float:
+    case MTLPixelFormatRGBA16Unorm: case MTLPixelFormatRGBA16Snorm: case MTLPixelFormatRGBA16Uint:
+    case MTLPixelFormatRGBA16Sint: case MTLPixelFormatRGBA16Float:
+    case MTLPixelFormatRGBA32Uint: case MTLPixelFormatRGBA32Sint: case MTLPixelFormatRGBA32Float:
+    case MTLPixelFormatDepth16Unorm: case MTLPixelFormatDepth32Float: case MTLPixelFormatStencil8:
+    case MTLPixelFormatDepth32Float_Stencil8: case MTLPixelFormatX32_Stencil8:
+    case 554: /* BGR10_XR */
+    case 555: /* BGR10_XR_sRGB */
+        return fmt;
+    default:
+        if ((NSUInteger)fmt >= 186 && (NSUInteger)fmt <= 243) return fmt; // ASTC
+        if ((NSUInteger)fmt >= 160 && (NSUInteger)fmt <= 185) return fmt; // PVRTC
+        break;
+    }
+
+    static int warned;
+    if (warned++ < 8) {
+        fprintf(stderr, "hengevm: pvg-metal: invalid/unsupported pixelFormat %lu, remapped to RGBA8Unorm\n", (unsigned long)fmt);
+    }
+    return MTLPixelFormatRGBA8Unorm;
+}
+
 /* The two serialized forms of a texture description. */
 static MTLTextureDescriptor *descriptor_v1(const uint8_t *d) {
     MTLTextureDescriptor *t = [MTLTextureDescriptor new];
     t.textureType = (MTLTextureType)(d[0] & 0xf);
     t.usage = d[1];
-    t.pixelFormat = (MTLPixelFormat)(d[2] | d[3] << 8);
+    t.pixelFormat = safe_pixel_format((MTLPixelFormat)(d[2] | d[3] << 8));
     t.width = *(const uint32_t *)(d + 4);
     t.height = *(const uint32_t *)(d + 8);
     t.depth = *(const uint32_t *)(d + 12);
@@ -396,7 +484,7 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     memcpy(&usage, d + 3, 4), memcpy(&w, d + 7, 4), memcpy(&h, d + 11, 4), memcpy(&depth, d + 15, 4);
     memcpy(&mips, d + 19, 2), memcpy(&samples, d + 21, 2), memcpy(&array, d + 23, 2), memcpy(&options, d + 25, 2);
     t.textureType = (MTLTextureType)(d[0] & 0xf);
-    t.pixelFormat = (MTLPixelFormat)(d[1] | d[2] << 8);
+    t.pixelFormat = safe_pixel_format((MTLPixelFormat)(d[1] | d[2] << 8));
     t.usage = usage;
     t.width = w, t.height = h, t.depth = depth;
     t.mipmapLevelCount = mips, t.sampleCount = samples, t.arrayLength = array;
@@ -559,6 +647,18 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
             [self complain:[NSString stringWithFormat:@"pipeline descriptor %u: %@", tag, ctx->failure]];
             return nil;
         }
+        if (tag == 0xe) {
+            MTLRenderPipelineDescriptor *rp = descriptor;
+            if ((NSUInteger)rp.depthAttachmentPixelFormat == 255) {
+                rp.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+            }
+            for (int i = 0; i < 8; i++) {
+                MTLRenderPipelineColorAttachmentDescriptor *c = rp.colorAttachments[i];
+                if (c && c.pixelFormat != MTLPixelFormatInvalid) {
+                    c.pixelFormat = safe_pixel_format(c.pixelFormat);
+                }
+            }
+        }
         NSError *err = nil;
         id state = tag == 0xe ? [device newRenderPipelineStateWithDescriptor:descriptor error:&err]
                               : [device newRenderPipelineStateWithTileDescriptor:descriptor options:MTLPipelineOptionNone reflection:nil error:&err];
@@ -716,7 +816,7 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     memcpy(o->tex_layout, layout + 0x18, table);
     const uint8_t *rec = layout + 0x18 + table;
     uint32_t tag = *(const uint32_t *)rec;
-    MTLTextureDescriptor *t = (tag == 0x34 || tag == 0x39) ? descriptor_v2(rec + 12) : descriptor_v1(rec + 12);
+    MTLTextureDescriptor *t = is_v2_tag(tag) ? descriptor_v2(rec + 12) : descriptor_v1(rec + 12);
     t.storageMode = MTLStorageModePrivate;
     t.usage |= MTLTextureUsageShaderRead;
     o->object = [device newTextureWithDescriptor:t];
@@ -729,21 +829,21 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     struct __attribute__((packed)) { uint32_t tag, size, ref, buffer; uint64_t offset, row; uint8_t d[64]; } h;
     memset(&h, 0, sizeof h);
     if (hv_pvg_lite_task_read(lite, task, at, &h, MIN(size, (uint32_t)sizeof h))) return;
-    if (h.tag == 0x34 || h.tag == 0x14 || h.tag == 1) { /* no guest memory at all: {tag, size, ref, description} */
+    if (is_v2_tag(h.tag) || h.tag == 0x14 || h.tag == 1) { /* no guest memory at all: {tag, size, ref, description} */
         const uint8_t *desc = (const uint8_t *)&h.buffer;
-        MTLTextureDescriptor *t = h.tag == 0x34 ? descriptor_v2(desc) : descriptor_v1(desc);
+        MTLTextureDescriptor *t = is_v2_tag(h.tag) ? descriptor_v2(desc) : descriptor_v1(desc);
         t.storageMode = MTLStorageModePrivate;
         o->object = [device newTextureWithDescriptor:t];
         if (!o->object) [self complain:[NSString stringWithFormat:@"texture format %lu %lux%lu samples %lu failed", (unsigned long)t.pixelFormat, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.sampleCount]];
         return;
     }
-    if (h.tag == 0x15 || h.tag == 0x38) { /* in a heap: {tag, size, ref, heap, description, offset after 0x24 or 0x2c} */
+    if (h.tag == 0x15 || is_v2_tag(h.tag)) { /* in a heap: {tag, size, ref, heap, description, offset after 0x24 or 0x2c} */
         const uint8_t *desc = (const uint8_t *)&h.offset;
         uint64_t offset;
-        memcpy(&offset, desc + (h.tag == 0x38 ? 0x2c : 0x24), 8);
+        memcpy(&offset, desc + (is_v2_tag(h.tag) ? 0x2c : 0x24), 8);
         HvObject *parent = [self object:h.buffer task:task];
         id<MTLHeap> heap = parent ? parent->object : nil;
-        MTLTextureDescriptor *t = h.tag == 0x38 ? descriptor_v2(desc) : descriptor_v1(desc);
+        MTLTextureDescriptor *t = is_v2_tag(h.tag) ? descriptor_v2(desc) : descriptor_v1(desc);
         t.resourceOptions = heap ? heap.resourceOptions : MTLResourceStorageModePrivate;
         o->parent = parent;
         o->object = [heap newTextureWithDescriptor:t offset:(NSUInteger)offset];
@@ -763,14 +863,15 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
         o->parent = parent;
         o->surface = parent->surface;
         NSRange levels = NSMakeRange((NSUInteger)v.levels[0], (NSUInteger)v.levels[1]), slices = NSMakeRange((NSUInteger)v.slices[0], (NSUInteger)v.slices[1]);
-        if (h.tag == 7) o->object = [from newTextureViewWithPixelFormat:(MTLPixelFormat)v.format];
-        else if (h.tag == 8) o->object = [from newTextureViewWithPixelFormat:(MTLPixelFormat)v.format textureType:(MTLTextureType)v.type levels:levels slices:slices];
-        else o->object = [from newTextureViewWithPixelFormat:(MTLPixelFormat)v.format textureType:(MTLTextureType)v.type levels:levels slices:slices
+        MTLPixelFormat vf = safe_pixel_format((MTLPixelFormat)v.format);
+        if (h.tag == 7) o->object = [from newTextureViewWithPixelFormat:vf];
+        else if (h.tag == 8) o->object = [from newTextureViewWithPixelFormat:vf textureType:(MTLTextureType)v.type levels:levels slices:slices];
+        else o->object = [from newTextureViewWithPixelFormat:vf textureType:(MTLTextureType)v.type levels:levels slices:slices
                                                      swizzle:safe_swizzle(v.swizzle, (const uint8_t *)&v, sizeof v, "view")];
         if (!o->object) [self complain:[NSString stringWithFormat:@"view tag %u of format %lu as %u failed", h.tag, (unsigned long)from.pixelFormat, v.format]];
         return;
     }
-    if (h.tag != 9 && h.tag != 0x37) {
+    if (h.tag != 9 && !is_v2_tag(h.tag)) {
         uint32_t w[24] = {0};
         hv_pvg_lite_task_read(lite, task, at, w, sizeof w);
         NSMutableString *m = [NSMutableString stringWithFormat:@"serialized texture tag %u:", h.tag];
@@ -781,7 +882,7 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     HvObject *b = [self object:h.buffer task:task];
     id<MTLBuffer> buffer = b ? b->object : nil;
     if (!buffer || ![buffer conformsToProtocol:@protocol(MTLBuffer)]) { [self complain:@"linear texture without a buffer"]; return; }
-    MTLTextureDescriptor *t = h.tag == 0x37 ? descriptor_v2(h.d) : descriptor_v1(h.d);
+    MTLTextureDescriptor *t = is_v2_tag(h.tag) ? descriptor_v2(h.d) : descriptor_v1(h.d);
     t.resourceOptions = buffer.resourceOptions;
     set_framebuffer_only(t, NO);
     t.usage |= MTLTextureUsageShaderRead;
@@ -1087,7 +1188,7 @@ static void sync_iosurface(HvObject *s) {
         for (int i = 0; i < 64; i += 4) fprintf(stderr, " %08x", *(uint32_t *)(h.d + i));
         fprintf(stderr, "\n");
     }
-    MTLTextureDescriptor *t = h.tag == 0x39 ? descriptor_v2(h.d) : descriptor_v1(h.d);
+    MTLTextureDescriptor *t = is_v2_tag(h.tag) ? descriptor_v2(h.d) : descriptor_v1(h.d);
     if (!surface) surface = [self newSurface:h.mapping];
     if (!surface) return;
     t.storageMode = MTLStorageModeShared;
@@ -1107,7 +1208,7 @@ static void sync_iosurface(HvObject *s) {
        macOS draws video and Safari's page tiles one plane at a time (R8 luma, RG8 chroma, R8 alpha): every view
        made over plane 0 left plane 1 empty, so chroma read back as zero (all green) and alpha as zero (blank pages). */
     uint16_t plane;
-    memcpy(&plane, h.d + (h.tag == 0x39 ? 0x28 : 0x20), 2);
+    memcpy(&plane, h.d + (is_v2_tag(h.tag) ? 0x28 : 0x20), 2);
     static int plane0 = -1; /* HV_PVG_PLANE0 (testing): every view on plane 0, as before this was read */
     if (plane0 < 0) plane0 = getenv("HV_PVG_PLANE0") != NULL;
     if (plane0) plane = 0;
