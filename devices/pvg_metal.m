@@ -680,6 +680,9 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
             if ((NSUInteger)rp.depthAttachmentPixelFormat == 255) {
                 rp.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
             }
+            if ((NSUInteger)rp.stencilAttachmentPixelFormat == 255 || (NSUInteger)rp.stencilAttachmentPixelFormat == 262) {
+                rp.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+            }
             for (int i = 0; i < 8; i++) {
                 MTLRenderPipelineColorAttachmentDescriptor *c = rp.colorAttachments[i];
                 if (c && c.pixelFormat != MTLPixelFormatInvalid) {
@@ -916,7 +919,20 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     t.usage |= MTLTextureUsageShaderRead;
     o->parent = b;
     o->follows = b, o->follows_generation = b->generation;
-    if (linear_texture_fits(device, t, h.offset, h.row, buffer.length)) o->object = [buffer newTextureWithDescriptor:t offset:h.offset bytesPerRow:h.row];
+    if (linear_texture_fits(device, t, h.offset, h.row, buffer.length)) {
+        o->object = [buffer newTextureWithDescriptor:t offset:h.offset bytesPerRow:h.row];
+    }
+    if (!o->object) {
+        /* When buffer row alignment is rejected by Metal, allocate standalone and populate via replaceRegion */
+        t.storageMode = MTLStorageModeShared;
+        o->object = [device newTextureWithDescriptor:t];
+        if (o->object && buffer.contents) {
+            NSUInteger bpp = pixel_bytes(t.pixelFormat);
+            if (h.row >= t.width * (bpp ? bpp : 1) && h.offset + h.row * t.height <= buffer.length) {
+                [o->object replaceRegion:MTLRegionMake2D(0, 0, t.width, t.height) mipmapLevel:0 withBytes:((const uint8_t *)buffer.contents + h.offset) bytesPerRow:(NSUInteger)h.row];
+            }
+        }
+    }
     if (!o->object) [self complain:[NSString stringWithFormat:@"linear texture format %lu row %llu failed", (unsigned long)t.pixelFormat, h.row]];
 }
 
@@ -1260,9 +1276,18 @@ static void sync_iosurface(HvObject *s) {
     else if (linear_texture_fits(device, t, surface->first, surface->row, ((id<MTLBuffer>)surface->object).length))
         o->object = [(id<MTLBuffer>)surface->object newTextureWithDescriptor:t offset:surface->first bytesPerRow:surface->row];
     if (!o->object) {
-        [self complain:[NSString stringWithFormat:@"surface %llu: format %lu row %llu not possible", h.mapping, (unsigned long)t.pixelFormat, surface->row]];
-        t.storageMode = MTLStorageModePrivate;
-        o->object = [device newTextureWithDescriptor:t]; /* something to bind: it stays empty */
+        /* When linear alignment is rejected by Metal, allocate standalone and populate via replaceRegion */
+        static int told;
+        if (told++ < 8) fprintf(stderr, "hengevm: pvg-metal: surface %llu: format %lu row %llu not linear-aligned; allocating copy texture\n",
+                                h.mapping, (unsigned long)t.pixelFormat, (unsigned long)surface->row);
+        t.storageMode = MTLStorageModeShared;
+        o->object = [device newTextureWithDescriptor:t];
+        if (o->object && surface->mapped) {
+            NSUInteger bpp = pixel_bytes(t.pixelFormat);
+            if (surface->row >= t.width * (bpp ? bpp : 1) && surface->first + surface->row * t.height <= surface->length) {
+                [o->object replaceRegion:MTLRegionMake2D(0, 0, t.width, t.height) mipmapLevel:0 withBytes:(surface->mapped + surface->first) bytesPerRow:(NSUInteger)surface->row];
+            }
+        }
     }
     if (!plane) mapped_textures[@(h.mapping)] = o->object;
 }
@@ -1375,12 +1400,12 @@ static BOOL has_guest_pages(HvObject *o) {
             uint64_t off, row;
             uint32_t w, h, d;
             memcpy(&off, mip, 8), memcpy(&row, mip + 0x10, 8), memcpy(&w, mip + 0x18, 4), memcpy(&h, mip + 0x1c, 4), memcpy(&d, mip + 0x20, 4);
+            if (!row && bpp > 0) row = w * bpp;
             uint32_t bh = o->tex_block_h ? o->tex_block_h : 1;
             uint64_t from = o->tex_base + o->tex_stride * s + off;
             uint64_t image = row * ((h + bh - 1) / bh);
-            if (bpp > 0 && row < w * bpp) continue;
             uint64_t needed_bytes = from + image * d;
-            if (needed_bytes > o->length || needed_bytes > copy.length) continue;
+            if (needed_bytes > o->length || (copy && needed_bytes > copy.length)) continue;
             if (down)
                 [*blit copyFromTexture:tex sourceSlice:s sourceLevel:m sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, d)
                               toBuffer:copy destinationOffset:from destinationBytesPerRow:row destinationBytesPerImage:image];
@@ -1474,6 +1499,13 @@ typedef struct {
     }
     if (!d.depthAttachment.texture) d.depthAttachment.loadAction = MTLLoadActionDontCare, d.depthAttachment.storeAction = MTLStoreActionDontCare;
     if (!d.stencilAttachment.texture) d.stencilAttachment.loadAction = MTLLoadActionDontCare, d.stencilAttachment.storeAction = MTLStoreActionDontCare;
+    if (d.depthAttachment.texture && !d.stencilAttachment.texture && is_depth_stencil_format(d.depthAttachment.texture.pixelFormat)) {
+        if (d.depthAttachment.texture.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 || (NSUInteger)d.depthAttachment.texture.pixelFormat == 255) {
+            d.stencilAttachment.texture = d.depthAttachment.texture;
+            d.stencilAttachment.loadAction = MTLLoadActionDontCare;
+            d.stencilAttachment.storeAction = MTLStoreActionDontCare;
+        }
+    }
     /* After the attachments: the visibility buffer and the render target's size. */
     if (r.size >= 0x248) {
         if (U32(0x22c)) d.visibilityResultBuffer = [self get:U32(0x22c) task:task];
@@ -2112,9 +2144,8 @@ typedef struct {
         memcpy(&size, r.p + 0x20, sizeof size), memcpy(&origin, r.p + 0x38, sizeof origin);
         NSUInteger bpp = pixel_bytes(t.pixelFormat);
         uint64_t row = U64(0x10), off = U64(8), img = U64(0x18);
-        if (bpp > 0 && row < size.width * bpp) break;
-        uint64_t req = off + (size.depth > 1 ? img * (size.depth - 1) : 0) + (size.height > 1 ? row * (size.height - 1) : 0) + size.width * (bpp ? bpp : 1);
-        if (req > b.length) break;
+        if (!row && bpp > 0) row = size.width * bpp;
+        if (off >= b.length) break;
         [e copyFromBuffer:b sourceOffset:(NSUInteger)off sourceBytesPerRow:(NSUInteger)row sourceBytesPerImage:(NSUInteger)img sourceSize:size
                 toTexture:t destinationSlice:U16(0x50) destinationLevel:U16(0x52) destinationOrigin:origin options:(MTLBlitOption)U32(0x54)];
         break;
@@ -2139,9 +2170,8 @@ typedef struct {
         memcpy(&origin, r.p + 8, sizeof origin), memcpy(&size, r.p + 0x20, sizeof size);
         NSUInteger bpp = pixel_bytes(t.pixelFormat);
         uint64_t row = U64(0x40), off = U64(0x38), img = U64(0x48);
-        if (bpp > 0 && row < size.width * bpp) break;
-        uint64_t req = off + (size.depth > 1 ? img * (size.depth - 1) : 0) + (size.height > 1 ? row * (size.height - 1) : 0) + size.width * (bpp ? bpp : 1);
-        if (req > b.length) break;
+        if (!row && bpp > 0) row = size.width * bpp;
+        if (off >= b.length) break;
         [e copyFromTexture:t sourceSlice:U16(0x50) sourceLevel:U16(0x52) sourceOrigin:origin sourceSize:size toBuffer:b
             destinationOffset:(NSUInteger)off destinationBytesPerRow:(NSUInteger)row destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)U16(0x54)];
         break;
@@ -3006,7 +3036,8 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
                     /* "May be thrown away": Apple's host only marks it purgeable, and the bytes stay
                        until the system needs the memory. Here they just stay. */
                 } else if (op == 0x20 && n >= 4) {
-                    [r->tasks removeObjectForKey:@(args[0] >> 1)];
+                    /* Delete task: args[0] is the taskId as every other command names it */
+                    [r->tasks removeObjectForKey:@(args[0])];
                 } else {
                     hv_pvg_lite_command(lite, cmd, len);
                     if (op == 8 && n >= 16) {
