@@ -111,6 +111,10 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     HvObject *parent;
     /* A multi-plane surface's key in the replay's planar table, while it counts as one of its users. */
     NSString *planar_key;
+    /* Standalone copy texture fallback when Metal row alignment fails: */
+    BOOL copy_fallback;
+    uint64_t copy_offset, copy_row;
+    uint32_t copy_w, copy_h;
 }
 @end
 
@@ -384,6 +388,8 @@ static void descriptor_common(MTLTextureDescriptor *t, uint8_t flags, uint16_t o
 static MTLTextureSwizzleChannels safe_swizzle(const uint8_t *sw, const uint8_t *desc, size_t desc_len, const char *what) {
     if (!(sw[0] | sw[1] | sw[2] | sw[3])) /* all Zero: never meant, it would draw nothing; an unread field */
         return MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha);
+    if (sw[0] < MTLTextureSwizzleRed && sw[1] < MTLTextureSwizzleRed && sw[2] < MTLTextureSwizzleRed)
+        return MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha);
     for (int i = 0; i < 4; i++) {
         if (sw[i] > MTLTextureSwizzleAlpha) {
             static int told;
@@ -517,9 +523,7 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     t.width = w, t.height = h, t.depth = depth;
     t.mipmapLevelCount = mips, t.sampleCount = samples, t.arrayLength = array;
     descriptor_common(t, d[0], options);
-    t.swizzle = safe_swizzle(d + 0x23, d, 0x27, "texture");
-    if (t.usage & MTLTextureUsageRenderTarget) /* Metal aborts on a swizzled render target */
-        t.swizzle = MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha);
+    t.swizzle = MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha);
     return t;
 }
 
@@ -926,12 +930,12 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
         /* When buffer row alignment is rejected by Metal, allocate standalone and populate via replaceRegion */
         t.storageMode = MTLStorageModeShared;
         o->object = [device newTextureWithDescriptor:t];
-        if (o->object && buffer.contents) {
-            NSUInteger bpp = pixel_bytes(t.pixelFormat);
-            if (h.row >= t.width * (bpp ? bpp : 1) && h.offset + h.row * t.height <= buffer.length) {
-                [o->object replaceRegion:MTLRegionMake2D(0, 0, t.width, t.height) mipmapLevel:0 withBytes:((const uint8_t *)buffer.contents + h.offset) bytesPerRow:(NSUInteger)h.row];
-            }
-        }
+        o->copy_fallback = YES;
+        o->copy_offset = h.offset;
+        o->copy_row = h.row;
+        o->copy_w = (uint32_t)t.width;
+        o->copy_h = (uint32_t)t.height;
+        [self syncCopyTexture:o];
     }
     if (!o->object) [self complain:[NSString stringWithFormat:@"linear texture format %lu row %llu failed", (unsigned long)t.pixelFormat, h.row]];
 }
@@ -1282,12 +1286,12 @@ static void sync_iosurface(HvObject *s) {
                                 h.mapping, (unsigned long)t.pixelFormat, (unsigned long)surface->row);
         t.storageMode = MTLStorageModeShared;
         o->object = [device newTextureWithDescriptor:t];
-        if (o->object && surface->mapped) {
-            NSUInteger bpp = pixel_bytes(t.pixelFormat);
-            if (surface->row >= t.width * (bpp ? bpp : 1) && surface->first + surface->row * t.height <= surface->length) {
-                [o->object replaceRegion:MTLRegionMake2D(0, 0, t.width, t.height) mipmapLevel:0 withBytes:(surface->mapped + surface->first) bytesPerRow:(NSUInteger)surface->row];
-            }
-        }
+        o->copy_fallback = YES;
+        o->copy_offset = surface->first;
+        o->copy_row = surface->row;
+        o->copy_w = (uint32_t)t.width;
+        o->copy_h = (uint32_t)t.height;
+        [self syncCopyTexture:o];
     }
     if (!plane) mapped_textures[@(h.mapping)] = o->object;
 }
@@ -1356,8 +1360,34 @@ static void sync_iosurface(HvObject *s) {
     return o;
 }
 
+- (void)syncCopyTexture:(HvObject *)o {
+    if (!o || !o->object || !o->copy_fallback || !o->copy_w || !o->copy_h) return;
+    const uint8_t *src = NULL;
+    NSUInteger src_len = 0;
+    if (o->parent && [o->parent->object conformsToProtocol:@protocol(MTLBuffer)]) {
+        id<MTLBuffer> buf = o->parent->object;
+        src = buf.contents;
+        src_len = buf.length;
+    } else if (o->surface && o->surface->mapped) {
+        src = o->surface->mapped;
+        src_len = (NSUInteger)o->surface->length;
+    }
+    if (!src) return;
+    id<MTLTexture> tex = o->object;
+    NSUInteger bpp = pixel_bytes(tex.pixelFormat);
+    uint64_t row = o->copy_row;
+    if (!row && bpp > 0) row = o->copy_w * bpp;
+    uint64_t needed = o->copy_offset + (o->copy_h > 1 ? (o->copy_h - 1) * row : 0) + o->copy_w * (bpp ? bpp : 1);
+    if (needed <= src_len && row >= o->copy_w * (bpp ? bpp : 1)) {
+        [tex replaceRegion:MTLRegionMake2D(0, 0, o->copy_w, o->copy_h) mipmapLevel:0 withBytes:(src + o->copy_offset) bytesPerRow:(NSUInteger)row];
+    }
+}
+
 - (id)get:(uint32_t)ref task:(uint32_t)task {
     HvObject *o = [self object:ref task:task];
+    if (o && o->copy_fallback && o->object) {
+        [self syncCopyTexture:o];
+    }
     return o ? o->object : nil;
 }
 
@@ -1400,7 +1430,9 @@ static BOOL has_guest_pages(HvObject *o) {
             uint64_t off, row;
             uint32_t w, h, d;
             memcpy(&off, mip, 8), memcpy(&row, mip + 0x10, 8), memcpy(&w, mip + 0x18, 4), memcpy(&h, mip + 0x1c, 4), memcpy(&d, mip + 0x20, 4);
+            if (!w || !h || !d) continue;
             if (!row && bpp > 0) row = w * bpp;
+            if (h > 1 && !row) continue;
             uint32_t bh = o->tex_block_h ? o->tex_block_h : 1;
             uint64_t from = o->tex_base + o->tex_stride * s + off;
             uint64_t image = row * ((h + bh - 1) / bh);
@@ -1499,13 +1531,6 @@ typedef struct {
     }
     if (!d.depthAttachment.texture) d.depthAttachment.loadAction = MTLLoadActionDontCare, d.depthAttachment.storeAction = MTLStoreActionDontCare;
     if (!d.stencilAttachment.texture) d.stencilAttachment.loadAction = MTLLoadActionDontCare, d.stencilAttachment.storeAction = MTLStoreActionDontCare;
-    if (d.depthAttachment.texture && !d.stencilAttachment.texture && is_depth_stencil_format(d.depthAttachment.texture.pixelFormat)) {
-        if (d.depthAttachment.texture.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 || (NSUInteger)d.depthAttachment.texture.pixelFormat == 255) {
-            d.stencilAttachment.texture = d.depthAttachment.texture;
-            d.stencilAttachment.loadAction = MTLLoadActionDontCare;
-            d.stencilAttachment.storeAction = MTLStoreActionDontCare;
-        }
-    }
     /* After the attachments: the visibility buffer and the render target's size. */
     if (r.size >= 0x248) {
         if (U32(0x22c)) d.visibilityResultBuffer = [self get:U32(0x22c) task:task];
@@ -2146,6 +2171,8 @@ typedef struct {
         uint64_t row = U64(0x10), off = U64(8), img = U64(0x18);
         if (!row && bpp > 0) row = size.width * bpp;
         if (off >= b.length) break;
+        uint64_t req = off + (size.depth > 1 ? img * (size.depth - 1) : 0) + (size.height > 1 ? row * (size.height - 1) : 0) + (row ? row : size.width * (bpp ? bpp : 1));
+        if (req > b.length) break;
         [e copyFromBuffer:b sourceOffset:(NSUInteger)off sourceBytesPerRow:(NSUInteger)row sourceBytesPerImage:(NSUInteger)img sourceSize:size
                 toTexture:t destinationSlice:U16(0x50) destinationLevel:U16(0x52) destinationOrigin:origin options:(MTLBlitOption)U32(0x54)];
         break;
@@ -2172,6 +2199,8 @@ typedef struct {
         uint64_t row = U64(0x40), off = U64(0x38), img = U64(0x48);
         if (!row && bpp > 0) row = size.width * bpp;
         if (off >= b.length) break;
+        uint64_t req = off + (size.depth > 1 ? img * (size.depth - 1) : 0) + (size.height > 1 ? row * (size.height - 1) : 0) + (row ? row : size.width * (bpp ? bpp : 1));
+        if (req > b.length) break;
         [e copyFromTexture:t sourceSlice:U16(0x50) sourceLevel:U16(0x52) sourceOrigin:origin sourceSize:size toBuffer:b
             destinationOffset:(NSUInteger)off destinationBytesPerRow:(NSUInteger)row destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)U16(0x54)];
         break;
@@ -2304,7 +2333,7 @@ typedef struct {
             if (done.error.userInfo) {
                 fprintf(stderr, "hengevm: pvg-metal: command buffer userInfo: %s\n", done.error.userInfo.description.UTF8String);
             }
-            if (done.error.code == 0xb || done.error.code == 0x4) {
+            if (done.error.code == 3 || done.error.code == 4 || done.error.code == 0xb) {
                 static int recovered = 0;
                 if (recovered++ < 16) {
                     fprintf(stderr, "hengevm: pvg-metal: recreating command queue after GPU error %ld\n", (long)done.error.code);
@@ -3036,8 +3065,7 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
                     /* "May be thrown away": Apple's host only marks it purgeable, and the bytes stay
                        until the system needs the memory. Here they just stay. */
                 } else if (op == 0x20 && n >= 4) {
-                    /* Delete task: args[0] is the taskId as every other command names it */
-                    [r->tasks removeObjectForKey:@(args[0])];
+                    [r->tasks removeObjectForKey:@(args[0] >> 1)];
                 } else {
                     hv_pvg_lite_command(lite, cmd, len);
                     if (op == 8 && n >= 16) {
