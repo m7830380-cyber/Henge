@@ -385,6 +385,8 @@ static inline BOOL is_v2_tag(uint32_t tag) {
    macOS guests (especially 3D apps like Roblox Studio) request macOS-specific formats (Depth24_Stencil8,
    BC1..BC7) or pass unaligned v2 structures that read as garbage. Remap or sanitize to valid iOS formats. */
 static MTLPixelFormat safe_pixel_format(MTLPixelFormat fmt) {
+    if (fmt == MTLPixelFormatInvalid) return MTLPixelFormatInvalid;
+
     // 1. Remap macOS-only Depth24 / Stencil formats
     if ((NSUInteger)fmt == 255 /* MTLPixelFormatDepth24Unorm_Stencil8 */) {
         return MTLPixelFormatDepth32Float_Stencil8; // 260
@@ -461,12 +463,17 @@ static MTLPixelFormat safe_pixel_format(MTLPixelFormat fmt) {
     return MTLPixelFormatRGBA8Unorm;
 }
 
+static inline MTLPixelFormat safe_texture_pixel_format(MTLPixelFormat fmt) {
+    MTLPixelFormat f = safe_pixel_format(fmt);
+    return (f == MTLPixelFormatInvalid) ? MTLPixelFormatRGBA8Unorm : f;
+}
+
 /* The two serialized forms of a texture description. */
 static MTLTextureDescriptor *descriptor_v1(const uint8_t *d) {
     MTLTextureDescriptor *t = [MTLTextureDescriptor new];
     t.textureType = (MTLTextureType)(d[0] & 0xf);
     t.usage = d[1];
-    t.pixelFormat = safe_pixel_format((MTLPixelFormat)(d[2] | d[3] << 8));
+    t.pixelFormat = safe_texture_pixel_format((MTLPixelFormat)(d[2] | d[3] << 8));
     t.width = *(const uint32_t *)(d + 4);
     t.height = *(const uint32_t *)(d + 8);
     t.depth = *(const uint32_t *)(d + 12);
@@ -484,7 +491,7 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     memcpy(&usage, d + 3, 4), memcpy(&w, d + 7, 4), memcpy(&h, d + 11, 4), memcpy(&depth, d + 15, 4);
     memcpy(&mips, d + 19, 2), memcpy(&samples, d + 21, 2), memcpy(&array, d + 23, 2), memcpy(&options, d + 25, 2);
     t.textureType = (MTLTextureType)(d[0] & 0xf);
-    t.pixelFormat = safe_pixel_format((MTLPixelFormat)(d[1] | d[2] << 8));
+    t.pixelFormat = safe_texture_pixel_format((MTLPixelFormat)(d[1] | d[2] << 8));
     t.usage = usage;
     t.width = w, t.height = h, t.depth = depth;
     t.mipmapLevelCount = mips, t.sampleCount = samples, t.arrayLength = array;
@@ -829,21 +836,21 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     struct __attribute__((packed)) { uint32_t tag, size, ref, buffer; uint64_t offset, row; uint8_t d[64]; } h;
     memset(&h, 0, sizeof h);
     if (hv_pvg_lite_task_read(lite, task, at, &h, MIN(size, (uint32_t)sizeof h))) return;
-    if (is_v2_tag(h.tag) || h.tag == 0x14 || h.tag == 1) { /* no guest memory at all: {tag, size, ref, description} */
+    if (h.tag == 0x34 || h.tag == 0x14 || h.tag == 1) { /* no guest memory at all: {tag, size, ref, description} */
         const uint8_t *desc = (const uint8_t *)&h.buffer;
-        MTLTextureDescriptor *t = is_v2_tag(h.tag) ? descriptor_v2(desc) : descriptor_v1(desc);
+        MTLTextureDescriptor *t = (h.tag == 0x34) ? descriptor_v2(desc) : descriptor_v1(desc);
         t.storageMode = MTLStorageModePrivate;
         o->object = [device newTextureWithDescriptor:t];
         if (!o->object) [self complain:[NSString stringWithFormat:@"texture format %lu %lux%lu samples %lu failed", (unsigned long)t.pixelFormat, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.sampleCount]];
         return;
     }
-    if (h.tag == 0x15 || is_v2_tag(h.tag)) { /* in a heap: {tag, size, ref, heap, description, offset after 0x24 or 0x2c} */
+    if (h.tag == 0x15 || h.tag == 0x38) { /* in a heap: {tag, size, ref, heap, description, offset after 0x24 or 0x2c} */
         const uint8_t *desc = (const uint8_t *)&h.offset;
         uint64_t offset;
-        memcpy(&offset, desc + (is_v2_tag(h.tag) ? 0x2c : 0x24), 8);
+        memcpy(&offset, desc + (h.tag == 0x38 ? 0x2c : 0x24), 8);
         HvObject *parent = [self object:h.buffer task:task];
         id<MTLHeap> heap = parent ? parent->object : nil;
-        MTLTextureDescriptor *t = is_v2_tag(h.tag) ? descriptor_v2(desc) : descriptor_v1(desc);
+        MTLTextureDescriptor *t = (h.tag == 0x38) ? descriptor_v2(desc) : descriptor_v1(desc);
         t.resourceOptions = heap ? heap.resourceOptions : MTLResourceStorageModePrivate;
         o->parent = parent;
         o->object = [heap newTextureWithDescriptor:t offset:(NSUInteger)offset];
@@ -871,7 +878,7 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
         if (!o->object) [self complain:[NSString stringWithFormat:@"view tag %u of format %lu as %u failed", h.tag, (unsigned long)from.pixelFormat, v.format]];
         return;
     }
-    if (h.tag != 9 && !is_v2_tag(h.tag)) {
+    if (h.tag != 9 && h.tag != 0x37) {
         uint32_t w[24] = {0};
         hv_pvg_lite_task_read(lite, task, at, w, sizeof w);
         NSMutableString *m = [NSMutableString stringWithFormat:@"serialized texture tag %u:", h.tag];
@@ -882,7 +889,7 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     HvObject *b = [self object:h.buffer task:task];
     id<MTLBuffer> buffer = b ? b->object : nil;
     if (!buffer || ![buffer conformsToProtocol:@protocol(MTLBuffer)]) { [self complain:@"linear texture without a buffer"]; return; }
-    MTLTextureDescriptor *t = is_v2_tag(h.tag) ? descriptor_v2(h.d) : descriptor_v1(h.d);
+    MTLTextureDescriptor *t = (h.tag == 0x37) ? descriptor_v2(h.d) : descriptor_v1(h.d);
     t.resourceOptions = buffer.resourceOptions;
     set_framebuffer_only(t, NO);
     t.usage |= MTLTextureUsageShaderRead;
@@ -1188,7 +1195,7 @@ static void sync_iosurface(HvObject *s) {
         for (int i = 0; i < 64; i += 4) fprintf(stderr, " %08x", *(uint32_t *)(h.d + i));
         fprintf(stderr, "\n");
     }
-    MTLTextureDescriptor *t = is_v2_tag(h.tag) ? descriptor_v2(h.d) : descriptor_v1(h.d);
+    MTLTextureDescriptor *t = (h.tag == 0x39) ? descriptor_v2(h.d) : descriptor_v1(h.d);
     if (!surface) surface = [self newSurface:h.mapping];
     if (!surface) return;
     t.storageMode = MTLStorageModeShared;
@@ -1208,7 +1215,7 @@ static void sync_iosurface(HvObject *s) {
        macOS draws video and Safari's page tiles one plane at a time (R8 luma, RG8 chroma, R8 alpha): every view
        made over plane 0 left plane 1 empty, so chroma read back as zero (all green) and alpha as zero (blank pages). */
     uint16_t plane;
-    memcpy(&plane, h.d + (is_v2_tag(h.tag) ? 0x28 : 0x20), 2);
+    memcpy(&plane, h.d + ((h.tag == 0x39) ? 0x28 : 0x20), 2);
     static int plane0 = -1; /* HV_PVG_PLANE0 (testing): every view on plane 0, as before this was read */
     if (plane0 < 0) plane0 = getenv("HV_PVG_PLANE0") != NULL;
     if (plane0) plane = 0;

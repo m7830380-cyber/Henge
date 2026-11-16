@@ -17,9 +17,9 @@ enum EngineTuning {
         "HV_FLUSH": "2",       // disk flush: F_BARRIERFSYNC, ordered but without a full fsync
         "HV_STATS": "10",      // seconds between engine stats lines in the log; 0 = off
         "MTL_DEBUG_LAYER": "0", // disable Metal validation layer aborts
-        "METAL_DEBUG_ERROR_MODE": "0", // ignore Metal validation errors instead of calling abort()
-        "MTL_ERROR_MODE": "0",
-        "METAL_DEVICE_WRAPPER_TYPE": "0",
+        "MTL_ERROR_MODE": "ignore", // ignore Metal validation errors instead of calling abort()
+        "MTL_DEBUG_LAYER_ERROR_MODE": "ignore",
+        "MTL_DEBUG_LAYER_WARNING_MODE": "ignore",
     ]
 
     static func apply() {
@@ -43,6 +43,11 @@ enum EngineTuning {
                     .trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "{Documents}", with: docs.path)
             }
         }
+        if env["MTL_ERROR_MODE"] == "0" { env["MTL_ERROR_MODE"] = "ignore" }
+        if env["MTL_DEBUG_LAYER_ERROR_MODE"] == "0" { env["MTL_DEBUG_LAYER_ERROR_MODE"] = "ignore" }
+        if env["MTL_DEBUG_LAYER_WARNING_MODE"] == "0" { env["MTL_DEBUG_LAYER_WARNING_MODE"] = "ignore" }
+        unsetenv("METAL_DEBUG_ERROR_MODE")
+        unsetenv("METAL_DEVICE_WRAPPER_TYPE")
         for (k, v) in env.sorted(by: { $0.key < $1.key }) {
             setenv(k, v, 1)
             HengeLog.log("tuning", "\(k)=\(v)")
