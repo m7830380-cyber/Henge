@@ -251,6 +251,27 @@ static BOOL linear_texture_fits(id<MTLDevice> device, MTLTextureDescriptor *t, u
     return ok;
 }
 
+static inline BOOL is_depth_stencil_format(MTLPixelFormat f) {
+    switch ((NSUInteger)f) {
+    case MTLPixelFormatDepth16Unorm:
+    case MTLPixelFormatDepth32Float:
+    case MTLPixelFormatStencil8:
+    case MTLPixelFormatDepth32Float_Stencil8:
+    case MTLPixelFormatX32_Stencil8:
+    case 255: /* Depth24Unorm_Stencil8 */
+    case 262: /* X24_Stencil8 */
+        return YES;
+    default:
+        return NO;
+    }
+}
+
+static inline BOOL index_buffer_fits(id<MTLBuffer> b, NSUInteger offset, NSUInteger count, MTLIndexType type) {
+    if (!b) return NO;
+    NSUInteger idxSize = (type == MTLIndexTypeUInt16) ? 2 : 4;
+    return (count > 0 && offset + count * idxSize <= b.length);
+}
+
 static double now_seconds(void) {
     return (double)clock_gettime_nsec_np(CLOCK_MONOTONIC) * 1e-9;
 }
@@ -1344,6 +1365,8 @@ static BOOL has_guest_pages(HvObject *o) {
     }
     id<MTLTexture> tex = o->object;
     if (!tex || !o->tex_layout || tex.sampleCount > 1 || tex.isFramebufferOnly) return;
+    if (is_depth_stencil_format(tex.pixelFormat)) return; /* depth/stencil textures are GPU-internal; blit DMA faults */
+    NSUInteger bpp = pixel_bytes(tex.pixelFormat);
     NSUInteger faces = tex.textureType == MTLTextureTypeCube || tex.textureType == MTLTextureTypeCubeArray ? 6 : 1;
     if (!*blit) *blit = [cb blitCommandEncoder];
     for (uint32_t s = 0; s < o->tex_slices * faces; s++)
@@ -1355,7 +1378,9 @@ static BOOL has_guest_pages(HvObject *o) {
             uint32_t bh = o->tex_block_h ? o->tex_block_h : 1;
             uint64_t from = o->tex_base + o->tex_stride * s + off;
             uint64_t image = row * ((h + bh - 1) / bh);
-            if (from + image * d > o->length) continue;
+            if (bpp > 0 && row < w * bpp) continue;
+            uint64_t needed_bytes = from + image * d;
+            if (needed_bytes > o->length || needed_bytes > copy.length) continue;
             if (down)
                 [*blit copyFromTexture:tex sourceSlice:s sourceLevel:m sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, d)
                               toBuffer:copy destinationOffset:from destinationBytesPerRow:row destinationBytesPerImage:image];
@@ -1827,26 +1852,34 @@ typedef struct {
         break;
     case 7: { /* {primitive, index type, ref, count, offset} */
         id<MTLBuffer> b = [self get:U32(4) task:task];
-        if (b) [e drawIndexedPrimitives:(MTLPrimitiveType)U16(0) indexCount:U16(8) indexType:(MTLIndexType)U16(2) indexBuffer:b indexBufferOffset:U16(10)];
-        draws++;
+        if (index_buffer_fits(b, U16(10), U16(8), (MTLIndexType)U16(2))) {
+            [e drawIndexedPrimitives:(MTLPrimitiveType)U16(0) indexCount:U16(8) indexType:(MTLIndexType)U16(2) indexBuffer:b indexBufferOffset:U16(10)];
+            draws++;
+        }
         break;
     }
     case 6: {
         id<MTLBuffer> b = [self get:U32(4) task:task];
-        if (b) [e drawIndexedPrimitives:(MTLPrimitiveType)U16(0) indexCount:(NSUInteger)U64(8) indexType:(MTLIndexType)U16(2) indexBuffer:b indexBufferOffset:(NSUInteger)U64(16)];
-        draws++;
+        if (index_buffer_fits(b, (NSUInteger)U64(16), (NSUInteger)U64(8), (MTLIndexType)U16(2))) {
+            [e drawIndexedPrimitives:(MTLPrimitiveType)U16(0) indexCount:(NSUInteger)U64(8) indexType:(MTLIndexType)U16(2) indexBuffer:b indexBufferOffset:(NSUInteger)U64(16)];
+            draws++;
+        }
         break;
     }
     case 9: { /* {primitive, index type, ref, count 16, offset 16, instances 16} */
         id<MTLBuffer> b = [self get:U32(4) task:task];
-        if (b) [e drawIndexedPrimitives:(MTLPrimitiveType)U16(0) indexCount:U16(8) indexType:(MTLIndexType)U16(2) indexBuffer:b indexBufferOffset:U16(10) instanceCount:U16(12)];
-        draws++;
+        if (index_buffer_fits(b, U16(10), U16(8), (MTLIndexType)U16(2))) {
+            [e drawIndexedPrimitives:(MTLPrimitiveType)U16(0) indexCount:U16(8) indexType:(MTLIndexType)U16(2) indexBuffer:b indexBufferOffset:U16(10) instanceCount:U16(12)];
+            draws++;
+        }
         break;
     }
     case 8: { /* {primitive, index type, ref, count 64, offset 64, instances 64} */
         id<MTLBuffer> b = [self get:U32(4) task:task];
-        if (b) [e drawIndexedPrimitives:(MTLPrimitiveType)U16(0) indexCount:(NSUInteger)U64(8) indexType:(MTLIndexType)U16(2) indexBuffer:b indexBufferOffset:(NSUInteger)U64(16) instanceCount:(NSUInteger)U64(24)];
-        draws++;
+        if (index_buffer_fits(b, (NSUInteger)U64(16), (NSUInteger)U64(8), (MTLIndexType)U16(2))) {
+            [e drawIndexedPrimitives:(MTLPrimitiveType)U16(0) indexCount:(NSUInteger)U64(8) indexType:(MTLIndexType)U16(2) indexBuffer:b indexBufferOffset:(NSUInteger)U64(16) instanceCount:(NSUInteger)U64(24)];
+            draws++;
+        }
         break;
     }
     case 0: /* {primitive 32, start 64, count 64} */
@@ -1867,30 +1900,40 @@ typedef struct {
         break;
     case 10: case 28: { /* {primitive, index type, ref, offset 64, count 64, instances 64, base vertex 64, base instance 64} */
         id<MTLBuffer> b = [self get:U32(4) task:task];
-        if (b) [e drawIndexedPrimitives:(MTLPrimitiveType)U16(0) indexCount:(NSUInteger)U64(16) indexType:(MTLIndexType)U16(2) indexBuffer:b indexBufferOffset:(NSUInteger)U64(8)
-                          instanceCount:(NSUInteger)U64(24) baseVertex:(NSInteger)U64(32) baseInstance:(NSUInteger)U64(40)];
-        draws++;
+        if (index_buffer_fits(b, (NSUInteger)U64(8), (NSUInteger)U64(16), (MTLIndexType)U16(2))) {
+            [e drawIndexedPrimitives:(MTLPrimitiveType)U16(0) indexCount:(NSUInteger)U64(16) indexType:(MTLIndexType)U16(2) indexBuffer:b indexBufferOffset:(NSUInteger)U64(8)
+                              instanceCount:(NSUInteger)U64(24) baseVertex:(NSInteger)U64(32) baseInstance:(NSUInteger)U64(40)];
+            draws++;
+        }
         break;
     }
     case 11: case 29: { /* {primitive, index type, ref, offset 16, count 16, instances 16, base vertex 16, base instance 16}; 29's base vertex can be negative */
         id<MTLBuffer> b = [self get:U32(4) task:task];
         NSInteger base_vertex = tag == 29 ? (NSInteger)(int16_t)U16(14) : (NSInteger)U16(14);
-        if (b) [e drawIndexedPrimitives:(MTLPrimitiveType)U16(0) indexCount:U16(10) indexType:(MTLIndexType)U16(2) indexBuffer:b indexBufferOffset:U16(8)
-                          instanceCount:U16(12) baseVertex:base_vertex baseInstance:U16(16)];
-        draws++;
+        if (index_buffer_fits(b, U16(8), U16(10), (MTLIndexType)U16(2))) {
+            [e drawIndexedPrimitives:(MTLPrimitiveType)U16(0) indexCount:U16(10) indexType:(MTLIndexType)U16(2) indexBuffer:b indexBufferOffset:U16(8)
+                              instanceCount:U16(12) baseVertex:base_vertex baseInstance:U16(16)];
+            draws++;
+        }
         break;
     }
     case 16: { /* {ref, primitive 16, 2 unused, offset 64} */
         id<MTLBuffer> b = [self get:U32(0) task:task];
-        if (b) [e drawPrimitives:(MTLPrimitiveType)U16(4) indirectBuffer:b indirectBufferOffset:(NSUInteger)U64(8)];
-        draws++;
+        NSUInteger off = (NSUInteger)U64(8);
+        if (b && off + sizeof(MTLDrawPrimitivesIndirectArguments) <= b.length) {
+            [e drawPrimitives:(MTLPrimitiveType)U16(4) indirectBuffer:b indirectBufferOffset:off];
+            draws++;
+        }
         break;
     }
     case 17: { /* {primitive, index type, index ref, indirect ref, index offset 64, indirect offset 64} */
         id<MTLBuffer> index = [self get:U32(4) task:task], indirect = [self get:U32(8) task:task];
-        if (index && indirect) [e drawIndexedPrimitives:(MTLPrimitiveType)U16(0) indexType:(MTLIndexType)U16(2) indexBuffer:index indexBufferOffset:(NSUInteger)U64(12)
-                                          indirectBuffer:indirect indirectBufferOffset:(NSUInteger)U64(20)];
-        draws++;
+        NSUInteger indOff = (NSUInteger)U64(20);
+        if (index && indirect && indOff + sizeof(MTLDrawIndexedPrimitivesIndirectArguments) <= indirect.length) {
+            [e drawIndexedPrimitives:(MTLPrimitiveType)U16(0) indexType:(MTLIndexType)U16(2) indexBuffer:index indexBufferOffset:(NSUInteger)U64(12)
+                                              indirectBuffer:indirect indirectBufferOffset:indOff];
+            draws++;
+        }
         break;
     }
     case 154: { /* {count, then a viewport and a render target offset for each view} */
@@ -2063,27 +2106,44 @@ typedef struct {
         id<MTLBuffer> b = [self get:U32(0) task:task];
         id<MTLTexture> t = [self get:U32(4) task:task];
         if (!b || !t) break;
+        if (is_depth_stencil_format(t.pixelFormat)) break;
         MTLSize size;
         MTLOrigin origin;
         memcpy(&size, r.p + 0x20, sizeof size), memcpy(&origin, r.p + 0x38, sizeof origin);
-        [e copyFromBuffer:b sourceOffset:(NSUInteger)U64(8) sourceBytesPerRow:(NSUInteger)U64(0x10) sourceBytesPerImage:(NSUInteger)U64(0x18) sourceSize:size
+        NSUInteger bpp = pixel_bytes(t.pixelFormat);
+        uint64_t row = U64(0x10), off = U64(8), img = U64(0x18);
+        if (bpp > 0 && row < size.width * bpp) break;
+        uint64_t req = off + (size.depth > 1 ? img * (size.depth - 1) : 0) + (size.height > 1 ? row * (size.height - 1) : 0) + size.width * (bpp ? bpp : 1);
+        if (req > b.length) break;
+        [e copyFromBuffer:b sourceOffset:(NSUInteger)off sourceBytesPerRow:(NSUInteger)row sourceBytesPerImage:(NSUInteger)img sourceSize:size
                 toTexture:t destinationSlice:U16(0x50) destinationLevel:U16(0x52) destinationOrigin:origin options:(MTLBlitOption)U32(0x54)];
         break;
     }
     case 301: { /* buffer to buffer */
         id<MTLBuffer> a = [self get:U32(0) task:task], b = [self get:U32(4) task:task];
-        if (a && b) [e copyFromBuffer:a sourceOffset:(NSUInteger)U64(8) toBuffer:b destinationOffset:(NSUInteger)U64(0x10) size:(NSUInteger)U64(0x18)];
+        if (a && b) {
+            NSUInteger offA = (NSUInteger)U64(8), offB = (NSUInteger)U64(0x10), sz = (NSUInteger)U64(0x18);
+            if (offA + sz <= a.length && offB + sz <= b.length && sz > 0) {
+                [e copyFromBuffer:a sourceOffset:offA toBuffer:b destinationOffset:offB size:sz];
+            }
+        }
         break;
     }
     case 302: { /* texture to buffer */
         id<MTLTexture> t = [self get:U32(0) task:task];
         id<MTLBuffer> b = [self get:U32(4) task:task];
         if (!b || !t) break;
+        if (is_depth_stencil_format(t.pixelFormat)) break;
         MTLOrigin origin;
         MTLSize size;
         memcpy(&origin, r.p + 8, sizeof origin), memcpy(&size, r.p + 0x20, sizeof size);
+        NSUInteger bpp = pixel_bytes(t.pixelFormat);
+        uint64_t row = U64(0x40), off = U64(0x38), img = U64(0x48);
+        if (bpp > 0 && row < size.width * bpp) break;
+        uint64_t req = off + (size.depth > 1 ? img * (size.depth - 1) : 0) + (size.height > 1 ? row * (size.height - 1) : 0) + size.width * (bpp ? bpp : 1);
+        if (req > b.length) break;
         [e copyFromTexture:t sourceSlice:U16(0x50) sourceLevel:U16(0x52) sourceOrigin:origin sourceSize:size toBuffer:b
-            destinationOffset:(NSUInteger)U64(0x38) destinationBytesPerRow:(NSUInteger)U64(0x40) destinationBytesPerImage:(NSUInteger)U64(0x48) options:(MTLBlitOption)U16(0x54)];
+            destinationOffset:(NSUInteger)off destinationBytesPerRow:(NSUInteger)row destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)U16(0x54)];
         break;
     }
     case 303: { /* texture to texture */
@@ -2098,7 +2158,12 @@ typedef struct {
     }
     case 306: { /* fill: {ref, location, length, value} */
         id<MTLBuffer> b = [self get:U32(0) task:task];
-        if (b) [e fillBuffer:b range:NSMakeRange((NSUInteger)U64(4), (NSUInteger)U64(12)) value:r.p[20]];
+        if (b) {
+            NSUInteger loc = (NSUInteger)U64(4), len = (NSUInteger)U64(12);
+            if (loc + len <= b.length && len > 0) {
+                [e fillBuffer:b range:NSMakeRange(loc, len) value:r.p[20]];
+            }
+        }
         break;
     }
     case 307: {
@@ -2205,7 +2270,17 @@ typedef struct {
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
         if (done.error) {
             self->failed++;
-            fprintf(stderr, "hengevm: pvg-metal: command buffer: %s\n", done.error.localizedDescription.UTF8String);
+            fprintf(stderr, "hengevm: pvg-metal: command buffer: %s (code %ld)\n", done.error.localizedDescription.UTF8String, (long)done.error.code);
+            if (done.error.userInfo) {
+                fprintf(stderr, "hengevm: pvg-metal: command buffer userInfo: %s\n", done.error.userInfo.description.UTF8String);
+            }
+            if (done.error.code == 0xb || done.error.code == 0x4) {
+                static int recovered = 0;
+                if (recovered++ < 16) {
+                    fprintf(stderr, "hengevm: pvg-metal: recreating command queue after GPU error %ld\n", (long)done.error.code);
+                    self->queue = [self->device newCommandQueueWithMaxCommandBufferCount:64];
+                }
+            }
         }
         if (complete) hv_pvg_lite_complete(l, ch, stamp);
         atomic_fetch_sub(&self->inflight, 1);
