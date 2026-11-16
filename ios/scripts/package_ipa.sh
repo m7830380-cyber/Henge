@@ -44,6 +44,9 @@ if [ "$TROLLSTORE" = true ]; then for k in "${BANNED_KEYS[@]}"; do plutil -remov
 SAPP="$STAGE/Payload/Henge.app"
 plutil -insert HengeBuildCommit -string "$(git -C "$IOS/.." rev-parse --short=12 HEAD 2>/dev/null || echo unknown)" "$SAPP/Info.plist"
 plutil -insert HengeBuildDate -string "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$SAPP/Info.plist"
+plutil -replace MinimumOSVersion -string 16.2 "$SAPP/Info.plist" 2>/dev/null || true
+plutil -replace MinimumOSVersion -string 16.2 "$SAPP/PlugIns/HengeJITHelper.appex/Info.plist" 2>/dev/null || true
+plutil -replace MinimumOSVersion -string 16.2 "$SAPP/Frameworks/StikJIT.framework/Info.plist" 2>/dev/null || true
 # Apple's boot ROM is fetched on the device (BootROM.swift) and must never ship. An older build folder can still
 # hold a copy from when the app bundled it, so it goes, and nothing is packaged if any is left.
 rm -f "$SAPP/AVPBooter.vmapple2.bin"

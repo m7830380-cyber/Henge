@@ -102,7 +102,7 @@ test: all $(B)/map_names
 	  else echo "FAIL $$t (exit $$rc)"; echo "  native: $$native"; echo "  loaded: $$loaded"; sed 's/^/  /' $(B)/stderr.txt; fail=1; fi; done; exit $$fail
 
 # The loader, the dmg reader and the toy AppKit compiled for iOS 17, into a static library (not run: that needs the phone).
-IOS_CC = xcrun --sdk iphoneos clang -target arm64-apple-ios17.0 -O2 -Wall -Wextra -Wno-unused-parameter -fblocks
+IOS_CC = xcrun --sdk iphoneos clang -target arm64-apple-ios16.2 -O2 -Wall -Wextra -Wno-unused-parameter -fblocks
 ios-lib: | $(B)
 	mkdir -p $(B)/ios
 	for f in $(LOADER) $(DMG) shim/appkit_mini.m; do $(IOS_CC) -fobjc-arc -c $$f -o $(B)/ios/$$(basename $$f).o || exit 1; done

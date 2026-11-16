@@ -49,7 +49,7 @@ def versions():
             "localizedDescription": ((rel.get("body") or "").strip() or f"Henge {tag}.")[:4000],
             "downloadURL": ipa["browser_download_url"],
             "size": ipa["size"],
-            "minOSVersion": "17.0",
+            "minOSVersion": "16.2",
         })
         if len(out) >= KEEP:
             break
@@ -78,7 +78,7 @@ def main():
             "installs macOS right on the device, no Mac needed. Safari and Discord run, and the clipboard and a "
             "shared folder work between macOS and the device. It's emulation, so it runs slower than a real Mac. "
             "Henge needs JIT (StikDebug, its built-in StikJIT on iOS 26 or later, TrollStore or a jailbreak), "
-            "iOS 17 or later, an A14 or M1 chip or newer, and about 43 GB free."
+            "iOS 16.2 or later, an A14 or M1 chip or newer, and about 43 GB free."
         ),
         "iconURL": icon,
         "tintColor": "#2E6BFF",
