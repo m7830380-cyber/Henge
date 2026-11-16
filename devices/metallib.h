@@ -31,7 +31,11 @@ typedef struct {
     uint16_t lang_major, lang_minor;  /* Metal 3.1 */
 } HvMetallibTarget;
 
+extern const HvMetallibTarget hv_metallib_ios16;
 extern const HvMetallibTarget hv_metallib_ios17;
+
+void hv_metallib_set_target(const HvMetallibTarget *t);
+const HvMetallibTarget *hv_metallib_get_target(void);
 
 /* As hv_metallib_relabel, for any target (tests relabel a newer macOS's libraries for the one they run on). */
 int hv_metallib_relabel_for(uint8_t *buf, size_t len, int stage, const HvMetallibTarget *t, const char **why);

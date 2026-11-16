@@ -27,6 +27,17 @@
 #include <string.h>
 
 const HvMetallibTarget hv_metallib_ios17 = { "ios", 0x0001, 0x82, 17, 7, 2, 6, 3, 1 };
+const HvMetallibTarget hv_metallib_ios16 = { "ios", 0x0001, 0x82, 16, 7, 2, 5, 3, 0 };
+
+static const HvMetallibTarget *active_target = &hv_metallib_ios17;
+
+void hv_metallib_set_target(const HvMetallibTarget *t) {
+    if (t) active_target = t;
+}
+
+const HvMetallibTarget *hv_metallib_get_target(void) {
+    return active_target;
+}
 
 static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
 static uint32_t rd32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
@@ -570,5 +581,5 @@ int hv_metallib_relabel_for(uint8_t *buf, size_t len, int stage, const HvMetalli
 }
 
 int hv_metallib_relabel(uint8_t *buf, size_t len, int stage, const char **why) {
-    return hv_metallib_relabel_for(buf, len, stage, &hv_metallib_ios17, why);
+    return hv_metallib_relabel_for(buf, len, stage, active_target, why);
 }

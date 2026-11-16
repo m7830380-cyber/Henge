@@ -465,10 +465,42 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
         const char *f = getenv("HV_PVG_RELABEL");
         start_stage = f && atoi(f) >= 1 && atoi(f) <= 3 ? atoi(f) : 0;
     }
+    static dispatch_once_t target_once;
+    static BOOL is_ios16 = NO;
+    dispatch_once(&target_once, ^{
+        if (@available(iOS 17.0, *)) {
+            hv_metallib_set_target(&hv_metallib_ios17);
+            is_ios16 = NO;
+        } else {
+            hv_metallib_set_target(&hv_metallib_ios16);
+            is_ios16 = YES;
+        }
+    });
     NSError *err = nil, *first_err = nil;
     id<MTLLibrary> library = nil;
-    int last_stage = no_relabel ? 0 : start_stage >= 3 ? 3 : 2, loaded_at = -1;
-    for (int stage = no_relabel ? 0 : start_stage; stage <= last_stage && !library; stage = stage ? stage + 1 : 2) {
+    int loaded_at = -1;
+    int stages[4];
+    int nstages = 0;
+    if (no_relabel) {
+        stages[nstages++] = 0;
+    } else if (getenv("HV_PVG_RELABEL")) {
+        stages[nstages++] = start_stage;
+    } else if (is_ios16) {
+        if (start_stage > 0) {
+            stages[nstages++] = start_stage;
+            if (start_stage == 3) stages[nstages++] = 2;
+            else stages[nstages++] = 3;
+        } else {
+            stages[nstages++] = 3;
+            stages[nstages++] = 2;
+        }
+    } else {
+        if (start_stage == 0) stages[nstages++] = 0;
+        stages[nstages++] = 2;
+        if (start_stage >= 3) stages[nstages++] = 3;
+    }
+    for (int si = 0; si < nstages && !library; si++) {
+        int stage = stages[si];
         NSMutableData *try = lib;
         if (stage) {
             try = [lib mutableCopy];
@@ -482,7 +514,8 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
         if (library) loaded_at = stage;
         if (!library && !first_err) first_err = err;
         if (library && (stage != start_stage || (stage && first_err == nil && !getenv("HV_PVG_RELABEL_QUIET")))) {
-            [self complain:[NSString stringWithFormat:@"library: loaded relabelled for iOS 17 (stage %d; as sent: %@)", stage,
+            const char *target_name = is_ios16 ? "iOS 16" : "iOS 17";
+            [self complain:[NSString stringWithFormat:@"library: loaded relabelled for %s (stage %d; as sent: %@)", target_name, stage,
                                                       first_err.localizedDescription ?: @"not tried"]];
             start_stage = stage;
         } else if (!library && stage) {
