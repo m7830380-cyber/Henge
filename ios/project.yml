@@ -110,7 +110,7 @@ targets:
         script: |
           set -e
           cd "$SRCROOT/.."
-          make ios-lib build/henge-agent.gz build/tl-samples.dmg
+          env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET make ios-lib build/henge-agent.gz build/tl-samples.dmg
           ./tools/build_ios_restore.sh
         basedOnDependencyAnalysis: false
     postBuildScripts:

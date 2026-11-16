@@ -20,6 +20,8 @@ xcodebuild -project Henge.xcodeproj -scheme Henge -configuration Release -sdk ip
     -derivedDataPath "$DD" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build > "$DD.buildlog" 2>&1 || {
     # Never package what an older build left behind.
     grep -E "error:|BUILD" "$DD.buildlog" | sort -u
+    echo "--- Last 50 lines of build log ---"
+    tail -n 50 "$DD.buildlog"
     echo "==> the build failed; nothing packaged" >&2
     exit 1
 }
