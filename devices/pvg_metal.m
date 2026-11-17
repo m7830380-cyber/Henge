@@ -115,6 +115,7 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     BOOL copy_fallback;
     uint64_t copy_offset, copy_row;
     uint32_t copy_w, copy_h;
+    uint32_t orig_pixel_format;
 }
 @end
 
@@ -317,6 +318,7 @@ static BOOL map_pages(HvReplay *r, uint32_t task, HvObject *o) {
         uint8_t *src = pages[i] ? hv_pvg_lite_page(r->lite, pages[i]) : NULL;
         if (!src) {
             pages[i] = 0;
+            memset((void *)(base + (i << 14)), 0, 0x4000);
             continue;
         }
         vm_address_t to = base + (i << 14);
@@ -324,9 +326,9 @@ static BOOL map_pages(HvReplay *r, uint32_t task, HvObject *o) {
         kern_return_t kr = vm_remap(mach_task_self(), &to, 0x4000, 0, VM_FLAGS_OVERWRITE, mach_task_self(), (vm_address_t)src, FALSE, &cur, &max, VM_INHERIT_NONE);
         if (kr != KERN_SUCCESS) {
             fprintf(stderr, "hengevm: pvg-metal: vm_remap failed: %d\n", kr);
-            vm_deallocate(mach_task_self(), base, n << 14);
-            free(pages);
-            return NO;
+            pages[i] = 0;
+            memset((void *)(base + (i << 14)), 0, 0x4000);
+            continue;
         }
     }
     free(o->pages);
@@ -525,6 +527,263 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     descriptor_common(t, d[0], options);
     t.swizzle = MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha);
     return t;
+}
+
+static inline BOOL is_bc_format(uint32_t fmt) {
+    return (fmt >= 130 && fmt <= 135) || (fmt >= 140 && fmt <= 143) || (fmt >= 150 && fmt <= 153);
+}
+
+static inline BOOL is_bc_8byte(uint32_t fmt) {
+    return (fmt == 130 || fmt == 131 || fmt == 140 || fmt == 141);
+}
+
+static inline void decode_565(uint16_t c, uint8_t *r, uint8_t *g, uint8_t *b) {
+    *r = (uint8_t)(((c >> 11) & 0x1f) * 255 / 31);
+    *g = (uint8_t)(((c >> 5) & 0x3f) * 255 / 63);
+    *b = (uint8_t)((c & 0x1f) * 255 / 31);
+}
+
+static void decode_bc1_block(const uint8_t *src, uint8_t *dst, size_t dst_row, int bw, int bh) {
+    uint16_t c0 = *(const uint16_t *)src;
+    uint16_t c1 = *(const uint16_t *)(src + 2);
+    uint32_t bits = *(const uint32_t *)(src + 4);
+    uint8_t col[4][4];
+    decode_565(c0, &col[0][0], &col[0][1], &col[0][2]); col[0][3] = 255;
+    decode_565(c1, &col[1][0], &col[1][1], &col[1][2]); col[1][3] = 255;
+    if (c0 > c1) {
+        col[2][0] = (uint8_t)((2 * col[0][0] + col[1][0] + 1) / 3);
+        col[2][1] = (uint8_t)((2 * col[0][1] + col[1][1] + 1) / 3);
+        col[2][2] = (uint8_t)((2 * col[0][2] + col[1][2] + 1) / 3);
+        col[2][3] = 255;
+        col[3][0] = (uint8_t)((col[0][0] + 2 * col[1][0] + 1) / 3);
+        col[3][1] = (uint8_t)((col[0][1] + 2 * col[1][1] + 1) / 3);
+        col[3][2] = (uint8_t)((col[0][2] + 2 * col[1][2] + 1) / 3);
+        col[3][3] = 255;
+    } else {
+        col[2][0] = (uint8_t)((col[0][0] + col[1][0]) / 2);
+        col[2][1] = (uint8_t)((col[0][1] + col[1][1]) / 2);
+        col[2][2] = (uint8_t)((col[0][2] + col[1][2]) / 2);
+        col[2][3] = 255;
+        col[3][0] = 0; col[3][1] = 0; col[3][2] = 0; col[3][3] = 0;
+    }
+    for (int y = 0; y < bh; y++) {
+        uint8_t *row_dst = dst + y * dst_row;
+        for (int x = 0; x < bw; x++) {
+            uint32_t idx = (bits >> (2 * (y * 4 + x))) & 3;
+            row_dst[x * 4 + 0] = col[idx][0];
+            row_dst[x * 4 + 1] = col[idx][1];
+            row_dst[x * 4 + 2] = col[idx][2];
+            row_dst[x * 4 + 3] = col[idx][3];
+        }
+    }
+}
+
+static void decode_bc2_block(const uint8_t *src, uint8_t *dst, size_t dst_row, int bw, int bh) {
+    uint64_t a_bits = *(const uint64_t *)src;
+    uint16_t c0 = *(const uint16_t *)(src + 8);
+    uint16_t c1 = *(const uint16_t *)(src + 10);
+    uint32_t bits = *(const uint32_t *)(src + 12);
+    uint8_t col[4][3];
+    decode_565(c0, &col[0][0], &col[0][1], &col[0][2]);
+    decode_565(c1, &col[1][0], &col[1][1], &col[1][2]);
+    col[2][0] = (uint8_t)((2 * col[0][0] + col[1][0] + 1) / 3);
+    col[2][1] = (uint8_t)((2 * col[0][1] + col[1][1] + 1) / 3);
+    col[2][2] = (uint8_t)((2 * col[0][2] + col[1][2] + 1) / 3);
+    col[3][0] = (uint8_t)((col[0][0] + 2 * col[1][0] + 1) / 3);
+    col[3][1] = (uint8_t)((col[0][1] + 2 * col[1][1] + 1) / 3);
+    col[3][2] = (uint8_t)((col[0][2] + 2 * col[1][2] + 1) / 3);
+    for (int y = 0; y < bh; y++) {
+        uint8_t *row_dst = dst + y * dst_row;
+        for (int x = 0; x < bw; x++) {
+            uint32_t c_idx = (bits >> (2 * (y * 4 + x))) & 3;
+            uint32_t a_idx = (uint32_t)((a_bits >> (4 * (y * 4 + x))) & 0xf);
+            row_dst[x * 4 + 0] = col[c_idx][0];
+            row_dst[x * 4 + 1] = col[c_idx][1];
+            row_dst[x * 4 + 2] = col[c_idx][2];
+            row_dst[x * 4 + 3] = (uint8_t)(a_idx * 17);
+        }
+    }
+}
+
+static void decode_bc3_block(const uint8_t *src, uint8_t *dst, size_t dst_row, int bw, int bh) {
+    uint8_t a0 = src[0], a1 = src[1];
+    uint64_t a_bits = (uint64_t)src[2] | ((uint64_t)src[3] << 8) | ((uint64_t)src[4] << 16) |
+                      ((uint64_t)src[5] << 24) | ((uint64_t)src[6] << 32) | ((uint64_t)src[7] << 40);
+    uint8_t alphas[8];
+    alphas[0] = a0; alphas[1] = a1;
+    if (a0 > a1) {
+        for (int i = 1; i <= 6; i++) alphas[i + 1] = (uint8_t)(((7 - i) * a0 + i * a1 + 3) / 7);
+    } else {
+        for (int i = 1; i <= 4; i++) alphas[i + 1] = (uint8_t)(((5 - i) * a0 + i * a1 + 2) / 5);
+        alphas[6] = 0; alphas[7] = 255;
+    }
+    uint16_t c0 = *(const uint16_t *)(src + 8);
+    uint16_t c1 = *(const uint16_t *)(src + 10);
+    uint32_t bits = *(const uint32_t *)(src + 12);
+    uint8_t col[4][3];
+    decode_565(c0, &col[0][0], &col[0][1], &col[0][2]);
+    decode_565(c1, &col[1][0], &col[1][1], &col[1][2]);
+    col[2][0] = (uint8_t)((2 * col[0][0] + col[1][0] + 1) / 3);
+    col[2][1] = (uint8_t)((2 * col[0][1] + col[1][1] + 1) / 3);
+    col[2][2] = (uint8_t)((2 * col[0][2] + col[1][2] + 1) / 3);
+    col[3][0] = (uint8_t)((col[0][0] + 2 * col[1][0] + 1) / 3);
+    col[3][1] = (uint8_t)((col[0][1] + 2 * col[1][1] + 1) / 3);
+    col[3][2] = (uint8_t)((col[0][2] + 2 * col[1][2] + 1) / 3);
+    for (int y = 0; y < bh; y++) {
+        uint8_t *row_dst = dst + y * dst_row;
+        for (int x = 0; x < bw; x++) {
+            uint32_t c_idx = (bits >> (2 * (y * 4 + x))) & 3;
+            uint32_t a_idx = (uint32_t)((a_bits >> (3 * (y * 4 + x))) & 7);
+            row_dst[x * 4 + 0] = col[c_idx][0];
+            row_dst[x * 4 + 1] = col[c_idx][1];
+            row_dst[x * 4 + 2] = col[c_idx][2];
+            row_dst[x * 4 + 3] = alphas[a_idx];
+        }
+    }
+}
+
+static void decode_bc4_block(const uint8_t *src, uint8_t *dst, size_t dst_row, int bw, int bh) {
+    uint8_t r0 = src[0], r1 = src[1];
+    uint64_t bits = (uint64_t)src[2] | ((uint64_t)src[3] << 8) | ((uint64_t)src[4] << 16) |
+                    ((uint64_t)src[5] << 24) | ((uint64_t)src[6] << 32) | ((uint64_t)src[7] << 40);
+    uint8_t reds[8];
+    reds[0] = r0; reds[1] = r1;
+    if (r0 > r1) {
+        for (int i = 1; i <= 6; i++) reds[i + 1] = (uint8_t)(((7 - i) * r0 + i * r1 + 3) / 7);
+    } else {
+        for (int i = 1; i <= 4; i++) reds[i + 1] = (uint8_t)(((5 - i) * r0 + i * r1 + 2) / 5);
+        reds[6] = 0; reds[7] = 255;
+    }
+    for (int y = 0; y < bh; y++) {
+        uint8_t *row_dst = dst + y * dst_row;
+        for (int x = 0; x < bw; x++) {
+            uint32_t idx = (uint32_t)((bits >> (3 * (y * 4 + x))) & 7);
+            row_dst[x] = reds[idx];
+        }
+    }
+}
+
+static void decode_bc5_block(const uint8_t *src, uint8_t *dst, size_t dst_row, int bw, int bh) {
+    uint8_t r0 = src[0], r1 = src[1];
+    uint64_t r_bits = (uint64_t)src[2] | ((uint64_t)src[3] << 8) | ((uint64_t)src[4] << 16) |
+                      ((uint64_t)src[5] << 24) | ((uint64_t)src[6] << 32) | ((uint64_t)src[7] << 40);
+    uint8_t reds[8];
+    reds[0] = r0; reds[1] = r1;
+    if (r0 > r1) {
+        for (int i = 1; i <= 6; i++) reds[i + 1] = (uint8_t)(((7 - i) * r0 + i * r1 + 3) / 7);
+    } else {
+        for (int i = 1; i <= 4; i++) reds[i + 1] = (uint8_t)(((5 - i) * r0 + i * r1 + 2) / 5);
+        reds[6] = 0; reds[7] = 255;
+    }
+    const uint8_t *g_src = src + 8;
+    uint8_t g0 = g_src[0], g1 = g_src[1];
+    uint64_t g_bits = (uint64_t)g_src[2] | ((uint64_t)g_src[3] << 8) | ((uint64_t)g_src[4] << 16) |
+                      ((uint64_t)g_src[5] << 24) | ((uint64_t)g_src[6] << 32) | ((uint64_t)g_src[7] << 40);
+    uint8_t greens[8];
+    greens[0] = g0; greens[1] = g1;
+    if (g0 > g1) {
+        for (int i = 1; i <= 6; i++) greens[i + 1] = (uint8_t)(((7 - i) * g0 + i * g1 + 3) / 7);
+    } else {
+        for (int i = 1; i <= 4; i++) greens[i + 1] = (uint8_t)(((5 - i) * g0 + i * g1 + 2) / 5);
+        greens[6] = 0; greens[7] = 255;
+    }
+    for (int y = 0; y < bh; y++) {
+        uint8_t *row_dst = dst + y * dst_row;
+        for (int x = 0; x < bw; x++) {
+            uint32_t r_idx = (uint32_t)((r_bits >> (3 * (y * 4 + x))) & 7);
+            uint32_t g_idx = (uint32_t)((g_bits >> (3 * (y * 4 + x))) & 7);
+            row_dst[x * 2 + 0] = reds[r_idx];
+            row_dst[x * 2 + 1] = greens[g_idx];
+        }
+    }
+}
+
+static void decode_bc7_block(const uint8_t *src, uint8_t *dst, size_t dst_row, int bw, int bh) {
+    uint8_t b0 = src[0];
+    int mode = -1;
+    for (int m = 0; m < 8; m++) {
+        if (b0 & (1 << m)) { mode = m; break; }
+    }
+    if (mode == 6) {
+        uint64_t lo, hi;
+        memcpy(&lo, src, 8);
+        memcpy(&hi, src + 8, 8);
+        lo >>= 7;
+        uint8_t r0 = (uint8_t)(lo & 0x7f); lo >>= 7;
+        uint8_t r1 = (uint8_t)(lo & 0x7f); lo >>= 7;
+        uint8_t g0 = (uint8_t)(lo & 0x7f); lo >>= 7;
+        uint8_t g1 = (uint8_t)(lo & 0x7f); lo >>= 7;
+        uint8_t b_0 = (uint8_t)(lo & 0x7f); lo >>= 7;
+        uint8_t b_1 = (uint8_t)(lo & 0x7f); lo >>= 7;
+        uint8_t a0 = (uint8_t)(lo & 0x7f); lo >>= 7;
+        uint8_t a1 = (uint8_t)(lo & 0x7f); lo >>= 7;
+        uint8_t p0 = (uint8_t)(lo & 1);
+        uint8_t p1 = (uint8_t)(hi & 1); hi >>= 1;
+        uint8_t ep[2][4] = {
+            {(uint8_t)((r0 << 1) | p0), (uint8_t)((g0 << 1) | p0), (uint8_t)((b_0 << 1) | p0), (uint8_t)((a0 << 1) | p0)},
+            {(uint8_t)((r1 << 1) | p1), (uint8_t)((g1 << 1) | p1), (uint8_t)((b_1 << 1) | p1), (uint8_t)((a1 << 1) | p1)}
+        };
+        static const uint8_t bc7_w[16] = {0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64};
+        for (int y = 0; y < bh; y++) {
+            uint8_t *row_dst = dst + y * dst_row;
+            for (int x = 0; x < bw; x++) {
+                int p_idx = y * 4 + x;
+                uint32_t w;
+                if (p_idx == 0) {
+                    w = (uint32_t)(hi & 7);
+                    hi >>= 3;
+                } else {
+                    w = (uint32_t)(hi & 0xf);
+                    hi >>= 4;
+                }
+                uint32_t factor = bc7_w[w & 0xf];
+                row_dst[x * 4 + 0] = (uint8_t)(((64 - factor) * ep[0][0] + factor * ep[1][0] + 32) >> 6);
+                row_dst[x * 4 + 1] = (uint8_t)(((64 - factor) * ep[0][1] + factor * ep[1][1] + 32) >> 6);
+                row_dst[x * 4 + 2] = (uint8_t)(((64 - factor) * ep[0][2] + factor * ep[1][2] + 32) >> 6);
+                row_dst[x * 4 + 3] = (uint8_t)(((64 - factor) * ep[0][3] + factor * ep[1][3] + 32) >> 6);
+            }
+        }
+        return;
+    }
+    for (int y = 0; y < bh; y++) {
+        uint8_t *row_dst = dst + y * dst_row;
+        for (int x = 0; x < bw; x++) {
+            row_dst[x * 4 + 0] = src[1];
+            row_dst[x * 4 + 1] = src[2];
+            row_dst[x * 4 + 2] = src[3];
+            row_dst[x * 4 + 3] = 255;
+        }
+    }
+}
+
+static void decode_bc_image(const uint8_t *src, uint8_t *dst, uint32_t w, uint32_t h, uint32_t fmt, uint64_t src_row, size_t dst_row) {
+    uint32_t nbx = (w + 3) / 4;
+    uint32_t nby = (h + 3) / 4;
+    BOOL is_8byte = is_bc_8byte(fmt);
+    size_t block_size = is_8byte ? 8 : 16;
+    for (uint32_t by = 0; by < nby; by++) {
+        const uint8_t *block_row = src + by * src_row;
+        int bh = (by == nby - 1 && (h % 4) != 0) ? (int)(h % 4) : 4;
+        for (uint32_t bx = 0; bx < nbx; bx++) {
+            const uint8_t *block = block_row + bx * block_size;
+            int bw = (bx == nbx - 1 && (w % 4) != 0) ? (int)(w % 4) : 4;
+            if (fmt == 130 || fmt == 131) {
+                decode_bc1_block(block, dst + (by * 4) * dst_row + (bx * 4) * 4, dst_row, bw, bh);
+            } else if (fmt == 132 || fmt == 133) {
+                decode_bc2_block(block, dst + (by * 4) * dst_row + (bx * 4) * 4, dst_row, bw, bh);
+            } else if (fmt == 134 || fmt == 135) {
+                decode_bc3_block(block, dst + (by * 4) * dst_row + (bx * 4) * 4, dst_row, bw, bh);
+            } else if (fmt == 140 || fmt == 141) {
+                decode_bc4_block(block, dst + (by * 4) * dst_row + (bx * 4) * 1, dst_row, bw, bh);
+            } else if (fmt == 142 || fmt == 143) {
+                decode_bc5_block(block, dst + (by * 4) * dst_row + (bx * 4) * 2, dst_row, bw, bh);
+            } else if (fmt == 152 || fmt == 153) {
+                decode_bc7_block(block, dst + (by * 4) * dst_row + (bx * 4) * 4, dst_row, bw, bh);
+            } else {
+                decode_bc1_block(block, dst + (by * 4) * dst_row + (bx * 4) * 4, dst_row, bw, bh);
+            }
+        }
+    }
 }
 
 @implementation HvContext
@@ -851,8 +1110,15 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     memcpy(o->tex_layout, layout + 0x18, table);
     const uint8_t *rec = layout + 0x18 + table;
     uint32_t tag = *(const uint32_t *)rec;
-    MTLTextureDescriptor *t = is_v2_tag(tag) ? descriptor_v2(rec + 12) : descriptor_v1(rec + 12);
-    t.storageMode = MTLStorageModePrivate;
+    const uint8_t *desc = rec + 12;
+    uint32_t raw_fmt = is_v2_tag(tag) ? (uint32_t)(desc[1] | (desc[2] << 8)) : (uint32_t)(desc[2] | (desc[3] << 8));
+    o->orig_pixel_format = raw_fmt;
+    MTLTextureDescriptor *t = is_v2_tag(tag) ? descriptor_v2(desc) : descriptor_v1(desc);
+    if (is_bc_format(raw_fmt)) {
+        t.storageMode = MTLStorageModeShared;
+    } else {
+        t.storageMode = MTLStorageModePrivate;
+    }
     t.usage |= MTLTextureUsageShaderRead;
     o->object = [device newTextureWithDescriptor:t];
     o->guest_backed = YES;
@@ -866,8 +1132,10 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     if (hv_pvg_lite_task_read(lite, task, at, &h, MIN(size, (uint32_t)sizeof h))) return;
     if (h.tag == 0x34 || h.tag == 0x14 || h.tag == 1) { /* no guest memory at all: {tag, size, ref, description} */
         const uint8_t *desc = (const uint8_t *)&h.buffer;
+        uint32_t raw_fmt = (h.tag == 0x34) ? (uint32_t)(desc[1] | (desc[2] << 8)) : (uint32_t)(desc[2] | (desc[3] << 8));
+        o->orig_pixel_format = raw_fmt;
         MTLTextureDescriptor *t = (h.tag == 0x34) ? descriptor_v2(desc) : descriptor_v1(desc);
-        t.storageMode = MTLStorageModePrivate;
+        t.storageMode = is_bc_format(raw_fmt) ? MTLStorageModeShared : MTLStorageModePrivate;
         o->object = [device newTextureWithDescriptor:t];
         if (!o->object) [self complain:[NSString stringWithFormat:@"texture format %lu %lux%lu samples %lu failed", (unsigned long)t.pixelFormat, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.sampleCount]];
         return;
@@ -878,13 +1146,15 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
         memcpy(&offset, desc + (h.tag == 0x38 ? 0x2c : 0x24), 8);
         HvObject *parent = [self object:h.buffer task:task];
         id<MTLHeap> heap = parent ? parent->object : nil;
+        uint32_t raw_fmt = (h.tag == 0x38) ? (uint32_t)(desc[1] | (desc[2] << 8)) : (uint32_t)(desc[2] | (desc[3] << 8));
+        o->orig_pixel_format = raw_fmt;
         MTLTextureDescriptor *t = (h.tag == 0x38) ? descriptor_v2(desc) : descriptor_v1(desc);
         t.resourceOptions = heap ? heap.resourceOptions : MTLResourceStorageModePrivate;
         o->parent = parent;
         o->object = [heap newTextureWithDescriptor:t offset:(NSUInteger)offset];
         if (!o->object) {
             [self complain:[NSString stringWithFormat:@"heap texture format %lu %lux%lu at %llu of ref %u failed", (unsigned long)t.pixelFormat, (unsigned long)t.width, (unsigned long)t.height, offset, h.buffer]];
-            t.storageMode = MTLStorageModePrivate;
+            t.storageMode = is_bc_format(raw_fmt) ? MTLStorageModeShared : MTLStorageModePrivate;
             o->object = [device newTextureWithDescriptor:t];
         }
         return;
@@ -917,6 +1187,9 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     HvObject *b = [self object:h.buffer task:task];
     id<MTLBuffer> buffer = b ? b->object : nil;
     if (!buffer || ![buffer conformsToProtocol:@protocol(MTLBuffer)]) { [self complain:@"linear texture without a buffer"]; return; }
+    const uint8_t *desc = h.d;
+    uint32_t raw_fmt = (h.tag == 0x37) ? (uint32_t)(desc[1] | (desc[2] << 8)) : (uint32_t)(desc[2] | (desc[3] << 8));
+    o->orig_pixel_format = raw_fmt;
     MTLTextureDescriptor *t = (h.tag == 0x37) ? descriptor_v2(h.d) : descriptor_v1(h.d);
     t.resourceOptions = buffer.resourceOptions;
     set_framebuffer_only(t, NO);
@@ -1150,12 +1423,21 @@ static void sync_iosurface(HvObject *s) {
     }
     surface->mapped = (uint8_t *)base;
     for (uint64_t i = 0; i < n; i++) {
-        if (!(pages[i] & 1)) continue;
-        uint8_t *src = hv_pvg_lite_phys(lite, (uint64_t)(pages[i] & ~1u) << 12, 0x4000);
-        if (!src) continue;
         vm_address_t to = base + (i << 14);
+        if (!(pages[i] & 1)) {
+            memset((void *)to, 0, 0x4000);
+            continue;
+        }
+        uint8_t *src = hv_pvg_lite_phys(lite, (uint64_t)(pages[i] & ~1u) << 12, 0x4000);
+        if (!src) {
+            memset((void *)to, 0, 0x4000);
+            continue;
+        }
         vm_prot_t cur, max;
-        vm_remap(mach_task_self(), &to, 0x4000, 0, VM_FLAGS_OVERWRITE, mach_task_self(), (vm_address_t)src, FALSE, &cur, &max, VM_INHERIT_NONE);
+        kern_return_t kr = vm_remap(mach_task_self(), &to, 0x4000, 0, VM_FLAGS_OVERWRITE, mach_task_self(), (vm_address_t)src, FALSE, &cur, &max, VM_INHERIT_NONE);
+        if (kr != KERN_SUCCESS) {
+            memset((void *)to, 0, 0x4000);
+        }
     }
     surface->object = [device newBufferWithBytesNoCopy:surface->mapped length:surface->length options:MTLResourceStorageModeShared
                                            deallocator:^(void *at, NSUInteger size) { vm_deallocate(mach_task_self(), (vm_address_t)at, size); }];
@@ -1374,6 +1656,26 @@ static void sync_iosurface(HvObject *s) {
     }
     if (!src) return;
     id<MTLTexture> tex = o->object;
+    if (is_bc_format(o->orig_pixel_format)) {
+        uint32_t raw_fmt = o->orig_pixel_format;
+        BOOL is_8byte = is_bc_8byte(raw_fmt);
+        size_t block_size = is_8byte ? 8 : 16;
+        uint32_t nbx = (o->copy_w + 3) / 4;
+        uint32_t nby = (o->copy_h + 3) / 4;
+        uint64_t src_row = o->copy_row ? o->copy_row : (uint64_t)nbx * block_size;
+        uint64_t needed = o->copy_offset + src_row * nby;
+        if (needed <= src_len) {
+            size_t dst_bpp = (raw_fmt == 140 || raw_fmt == 141) ? 1 : ((raw_fmt == 142 || raw_fmt == 143) ? 2 : 4);
+            size_t decoded_row = (size_t)o->copy_w * dst_bpp;
+            uint8_t *decoded = malloc(decoded_row * o->copy_h);
+            if (decoded) {
+                decode_bc_image(src + o->copy_offset, decoded, o->copy_w, o->copy_h, raw_fmt, src_row, decoded_row);
+                [tex replaceRegion:MTLRegionMake2D(0, 0, o->copy_w, o->copy_h) mipmapLevel:0 withBytes:decoded bytesPerRow:decoded_row];
+                free(decoded);
+            }
+        }
+        return;
+    }
     NSUInteger bpp = pixel_bytes(tex.pixelFormat);
     uint64_t row = o->copy_row;
     if (!row && bpp > 0) row = o->copy_w * bpp;
@@ -1385,9 +1687,6 @@ static void sync_iosurface(HvObject *s) {
 
 - (id)get:(uint32_t)ref task:(uint32_t)task {
     HvObject *o = [self object:ref task:task];
-    if (o && o->copy_fallback && o->object) {
-        [self syncCopyTexture:o];
-    }
     return o ? o->object : nil;
 }
 
@@ -1421,6 +1720,48 @@ static BOOL has_guest_pages(HvObject *o) {
     id<MTLTexture> tex = o->object;
     if (!tex || !o->tex_layout || tex.sampleCount > 1 || tex.isFramebufferOnly) return;
     if (is_depth_stencil_format(tex.pixelFormat)) return; /* depth/stencil textures are GPU-internal; blit DMA faults */
+    if (is_bc_format(o->orig_pixel_format)) {
+        if (down) return;
+        const uint8_t *guest_bytes = o->mapped;
+        if (!guest_bytes) return;
+        uint32_t raw_fmt = o->orig_pixel_format;
+        BOOL is_8byte = is_bc_8byte(raw_fmt);
+        size_t block_size = is_8byte ? 8 : 16;
+        NSUInteger faces = tex.textureType == MTLTextureTypeCube || tex.textureType == MTLTextureTypeCubeArray ? 6 : 1;
+        for (uint32_t s = 0; s < o->tex_slices * faces; s++) {
+            for (uint32_t m = 0; m < o->tex_mips; m++) {
+                const uint8_t *mip = o->tex_layout + m * 36;
+                uint64_t off, row;
+                uint32_t w, h, d;
+                memcpy(&off, mip, 8), memcpy(&row, mip + 0x10, 8), memcpy(&w, mip + 0x18, 4), memcpy(&h, mip + 0x1c, 4), memcpy(&d, mip + 0x20, 4);
+                if (!w || !h || !d) continue;
+                uint32_t nbx = (w + 3) / 4;
+                uint32_t nby = (h + 3) / 4;
+                uint64_t src_row = row ? row : (uint64_t)nbx * block_size;
+                uint64_t from = o->tex_base + o->tex_stride * s + off;
+                uint64_t needed_bytes = from + src_row * nby * d;
+                if (needed_bytes > o->length || (copy && needed_bytes > copy.length)) continue;
+                size_t dst_bpp = (raw_fmt == 140 || raw_fmt == 141) ? 1 : ((raw_fmt == 142 || raw_fmt == 143) ? 2 : 4);
+                size_t decoded_row = (size_t)w * dst_bpp;
+                size_t decoded_image = decoded_row * h;
+                uint8_t *decoded = malloc(decoded_image * d);
+                if (!decoded) continue;
+                for (uint32_t z = 0; z < d; z++) {
+                    const uint8_t *slice_src = guest_bytes + from + z * (src_row * nby);
+                    uint8_t *slice_dst = decoded + z * decoded_image;
+                    decode_bc_image(slice_src, slice_dst, w, h, raw_fmt, src_row, decoded_row);
+                }
+                [tex replaceRegion:MTLRegionMake3D(0, 0, 0, w, h, d)
+                       mipmapLevel:m
+                             slice:s
+                         withBytes:decoded
+                       bytesPerRow:decoded_row
+                     bytesPerImage:decoded_image];
+                free(decoded);
+            }
+        }
+        return;
+    }
     NSUInteger bpp = pixel_bytes(tex.pixelFormat);
     NSUInteger faces = tex.textureType == MTLTextureTypeCube || tex.textureType == MTLTextureTypeCubeArray ? 6 : 1;
     if (!*blit) *blit = [cb blitCommandEncoder];
@@ -2333,10 +2674,10 @@ typedef struct {
             if (done.error.userInfo) {
                 fprintf(stderr, "hengevm: pvg-metal: command buffer userInfo: %s\n", done.error.userInfo.description.UTF8String);
             }
-            if (done.error.code == 3 || done.error.code == 4 || done.error.code == 0xb) {
+            if (done.error.code == 1 || done.error.code == 3 || done.error.code == 4 || done.error.code == 0xb) {
                 static int recovered = 0;
-                if (recovered++ < 16) {
-                    fprintf(stderr, "hengevm: pvg-metal: recreating command queue after GPU error %ld\n", (long)done.error.code);
+                if (recovered++ < 256) {
+                    fprintf(stderr, "hengevm: pvg-metal: recreating command queue after GPU error %ld (count %d)\n", (long)done.error.code, recovered);
                     self->queue = [self->device newCommandQueueWithMaxCommandBufferCount:64];
                 }
             }
@@ -2379,6 +2720,9 @@ typedef struct {
         if (!o) continue;
         if (o->mapped) refresh_pages(self, task, o);
         if (o->surface) sync_iosurface(o->surface);
+        if (o->copy_fallback && (res[i * 2 + 1] & 1)) {
+            [self syncCopyTexture:o];
+        }
         if (getenv("HV_PVG_TALLY") && (o->entry[0] & 0xff) == OBJ_MAPPED_TEXTURE) {
             static uint32_t seen[256];
             uint32_t f = res[i * 2 + 1] & 0xff, key = res[i * 2] & 0xff;
@@ -2387,10 +2731,18 @@ typedef struct {
                 fprintf(stderr, "pvgres task %u ref %u mapped flags %x\n", task, res[i * 2], res[i * 2 + 1]);
             }
         }
-        if (res[i * 2 + 1] & 1) o->guest_stale = NO, o->host_valid = NO; /* the guest wrote it */
-        if (o->guest_backed && !o->host_valid) {
-            if (!o->guest_stale) [self page:o toGuest:NO task:task blit:&blit commandBuffer:cb];
-            o->host_valid = YES;
+        HvObject *target = o->guest_backed ? o : (o->parent && o->parent->guest_backed ? o->parent : nil);
+        if (res[i * 2 + 1] & 1) {
+            o->guest_stale = NO;
+            o->host_valid = NO;
+            if (target) {
+                target->guest_stale = NO;
+                target->host_valid = NO;
+            }
+        }
+        if (target && target->guest_backed && !target->host_valid) {
+            if (!target->guest_stale) [self page:target toGuest:NO task:task blit:&blit commandBuffer:cb];
+            target->host_valid = YES;
         }
         if (res[i * 2 + 1] & 4) sync_after = YES;
     }
